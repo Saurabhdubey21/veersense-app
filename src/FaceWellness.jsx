@@ -43,7 +43,7 @@ export default function FaceWellness({ onClose, onResult }) {
       setLoadMsg("Starting camera...");
       const stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:"user"}});
       streamRef.current=stream;
-      if(videoRef.current){ videoRef.current.srcObject=stream; await videoRef.current.play(); }
+      if(videoRef.current){ videoRef.current.srcObject=stream; try{ await videoRef.current.play(); }catch(e){} }
       setPhase("ready");
     } catch(err){ setLoadMsg("Error: "+(err.message||"Camera error")); setPhase("error"); }
   };
