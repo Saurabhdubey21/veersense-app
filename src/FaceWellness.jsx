@@ -44,7 +44,7 @@ export default function FaceWellness({ onClose, onResult }) {
       const stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:"user"}});
       streamRef.current=stream;
       if(videoRef.current){ videoRef.current.srcObject=stream; try{ await videoRef.current.play(); }catch(e){} }
-      setPhase("ready");
+      setTimeout(()=>setPhase("ready"),1000);
     } catch(err){ setLoadMsg("Error: "+(err.message||"Camera error")); setPhase("error"); }
   };
 
@@ -63,7 +63,7 @@ export default function FaceWellness({ onClose, onResult }) {
   };
 
   const finishScan=(frames)=>{
-    if(frames.length===0){ setPhase("ready"); return; }
+    if(frames.length===0){ setTimeout(()=>setPhase("ready"),1000); return; }
     const keys=["happy","sad","angry","fearful","disgusted","surprised","neutral"];
     const avg={};
     keys.forEach(k=>{ avg[k]=frames.reduce((s,f)=>s+(f[k]||0),0)/frames.length; });
@@ -129,7 +129,7 @@ export default function FaceWellness({ onClose, onResult }) {
                 {aiLoading?<div style={{color:"#8D9AAE",fontSize:13}}>Analyzing...</div>:<div style={{fontSize:13,color:"rgba(255,255,255,0.8)",lineHeight:1.7}}>{aiAdvice}</div>}
               </div>
               <div style={{display:"flex",gap:8}}>
-                <button onClick={()=>{setPhase("ready");setWellness(null);setExpr(null);setAiAdvice("");setScan(0);}} style={{flex:1,padding:"11px",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,color:"#8D9AAE",cursor:"pointer",fontSize:13}}>Scan Again</button>
+                <button onClick={()=>{setTimeout(()=>setPhase("ready"),1000);setWellness(null);setExpr(null);setAiAdvice("");setScan(0);}} style={{flex:1,padding:"11px",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,color:"#8D9AAE",cursor:"pointer",fontSize:13}}>Scan Again</button>
                 <button onClick={()=>{if(onResult)onResult(wellness);cleanup();onClose();}} style={{flex:2,padding:"11px",background:"linear-gradient(135deg,#4F6B4A,#B8922F)",border:"none",borderRadius:10,color:"white",cursor:"pointer",fontSize:13,fontWeight:600}}>Use This Result</button>
               </div>
             </div>
