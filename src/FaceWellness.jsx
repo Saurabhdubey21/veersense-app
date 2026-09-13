@@ -1,385 +1,482 @@
-import { useState, useRef, useEffect } from "react";
-import * as tf from "@tensorflow/tfjs";
+import { useState, useEffect, useRef } from "react";
 
-const LABELS = ["angry","disgust","fear","happy","neutral","sad","surprise"];
+/* ═══════════════════════════════════════════════
+   FaceWellness — AI Face-based Stress Detection
+   Uses face-api.js for expression detection
+   + Claude AI for personalized wellness advice
+═══════════════════════════════════════════════ */
 
-function predictStress(probs) {
-  const angry   = probs[0] || 0;
-  const disgust = probs[1] || 0;
-  const fear    = probs[2] || 0;
-  const happy   = probs[3] || 0;
-  const neutral = probs[4] || 0;
-  const sad     = probs[5] || 0;
-  const surprise= probs[6] || 0;
+const FACE_API_CDN = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js";
+const MODELS_URL   = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights";
 
-  const raw = angry*90 + fear*85 + sad*75 + disgust*70 + surprise*40 + neutral*35 - happy*60;
-  const score = Math.max(0, Math.min(100, Math.round(raw * 100 + 30)));
-  const dominant = LABELS[probs.indexOf(Math.max(...probs))];
-  const risk = score >= 60 ? "High" : score >= 35 ? "Medium" : "Low";
+const T = {
+  ink:"#10192B", olive:"#4F6B4A", brass:"#B8922F",
+  paper:"#EDE9DD", crimson:"#C0392B", slate:"#8D9AAE",
+};
+const H = { fontFamily:"'Spectral',serif" };
+const S = { fontFamily:"'Inter',sans-serif" };
+
+// Map face expressions to stress indicators
+function expressionsToStress(expr) {
+  if (!expr) return { score: 50, mood: "Neutral", risk: "Medium" };
+  const {
+    happy = 0, sad = 0, angry = 0, fearful = 0,
+    disgusted = 0, surprised = 0, neutral = 0
+  } = expr;
+
+  // Stress score calculation from expressions
+  const stressRaw =
+    sad      * 70 +
+    angry    * 85 +
+    fearful  * 80 +
+    disgusted* 65 +
+    surprised* 30 +
+    neutral  * 40 -
+    happy    * 60;
+
+  const score = Math.max(0, Math.min(100, Math.round(50 + stressRaw * 50)));
+
+  // Dominant emotion
+  const emotions = { happy, sad, angry, fearful, disgusted, surprised, neutral };
+  const dominant = Object.entries(emotions).sort((a,b) => b[1]-a[1])[0][0];
+
   const moodMap = {
-    angry:"Stressed", disgust:"Uncomfortable", fear:"Anxious",
-    happy:"Happy", neutral:"Neutral", sad:"Sad", surprise:"Alert"
+    happy:    "Happy 😊",
+    sad:      "Sad 😔",
+    angry:    "Stressed 😤",
+    fearful:  "Anxious 😨",
+    disgusted:"Uncomfortable 😒",
+    surprised:"Alert 😮",
+    neutral:  "Neutral 😐"
   };
-  return { score, risk, dominant, mood: moodMap[dominant] || "Neutral", probs };
+
+  const risk = score >= 60 ? "High" : score >= 35 ? "Medium" : "Low";
+
+  return { score, mood: moodMap[dominant] || "Neutral", risk, dominant, expressions: expr };
 }
 
 export default function FaceWellness({ onClose, onResult }) {
-  const videoRef  = useRef(null);
-  const canvasRef = useRef(null);
-  const streamRef = useRef(null);
-  const timerRef  = useRef(null);
-  const modelRef  = useRef(null);
+  const videoRef    = useRef(null);
+  const canvasRef   = useRef(null);
+  const streamRef   = useRef(null);
+  const intervalRef = useRef(null);
 
-  const [phase,    setPhase]    = useState("init");
-  const [progress, setProgress] = useState(0);
-  const [result,   setResult]   = useState(null);
-  const [advice,   setAdvice]   = useState("");
-  const [loadMsg,  setLoadMsg]  = useState("Starting camera...");
-  const [probBars, setProbBars] = useState([]);
+  const [phase, setPhase]         = useState("loading"); // loading|ready|scanning|result|ai
+  const [loadMsg, setLoadMsg]     = useState("Loading face detection AI...");
+  const [scanProgress, setScan]   = useState(0);
+  const [expressions, setExpr]    = useState(null);
+  const [wellness, setWellness]   = useState(null);
+  const [aiAdvice, setAiAdvice]   = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [scanFrames, setScanFrames]     = useState([]);
 
+  // Load face-api.js
   useEffect(() => {
-    startCamera();
-    return () => stop();
+    const loadFaceAPI = async () => {
+      try {
+        if (!window.faceapi) {
+          setLoadMsg("Loading face detection models...");
+          await new Promise((res, rej) => {
+            const s = document.createElement("script");
+            s.src = FACE_API_CDN;
+            s.onload = res;
+            s.onerror = rej;
+            document.head.appendChild(s);
+          });
+        }
+
+        setLoadMsg("Loading expression models...");
+        await Promise.all([
+          window.faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL),
+          window.faceapi.nets.faceExpressionNet.loadFromUri(MODELS_URL),
+          window.faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODELS_URL),
+        ]);
+
+        setLoadMsg("Starting camera...");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: "user" }
+        });
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+        setPhase("ready");
+      } catch (err) {
+        setLoadMsg("Error: " + (err.message || "Could not load camera"));
+        setPhase("error");
+      }
+    };
+    loadFaceAPI();
+    return () => cleanup();
   }, []);
 
-  const stop = () => {
-    if (timerRef.current)  clearInterval(timerRef.current);
-    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
-  };
-
-  const startCamera = async () => {
-    try {
-      setPhase("init");
-      setLoadMsg("Starting camera...");
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      streamRef.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current.play().catch(() => {});
-          setPhase("ready");
-        };
-        videoRef.current.oncanplay = () => setPhase("ready");
-        videoRef.current.oncanplaythrough = () => setPhase("ready");
-        setTimeout(() => setPhase("ready"), 2000);
-      }
-    } catch (e) {
-      setLoadMsg("Camera error: " + e.message);
-      setPhase("error");
+  const cleanup = () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
     }
   };
 
-  const scan = async () => {
-    setPhase("loading");
-    setLoadMsg("Loading AI emotion model...");
-    setProgress(0);
-
-    try {
-      if (!modelRef.current) {
-        await tf.ready();
-        modelRef.current = await tf.loadLayersModel("/emotion_model.tflite/model.json");
-      }
-      setLoadMsg("Model loaded! Scanning face...");
-    } catch (e) {
-      setLoadMsg("Using built-in detection...");
-    }
-
+  const startScan = () => {
     setPhase("scanning");
-    let p = 0;
-    const allProbs = [];
+    setScan(0);
+    setScanFrames([]);
+    setFaceDetected(false);
+    let progress = 0;
+    const frames = [];
 
-    timerRef.current = setInterval(async () => {
-      if (videoRef.current && canvasRef.current) {
-        try {
-          const canvas = canvasRef.current;
-          const ctx    = canvas.getContext("2d");
-          canvas.width  = 48;
-          canvas.height = 48;
-          ctx.drawImage(videoRef.current, 0, 0, 48, 48);
-          const imageData = ctx.getImageData(0, 0, 48, 48);
+    intervalRef.current = setInterval(async () => {
+      if (!videoRef.current || !window.faceapi) return;
 
-          const tensor = tf.tidy(() => {
-            const raw = tf.browser.fromPixels(imageData, 1);
-            return raw.toFloat().div(255.0).expandDims(0);
-          });
+      try {
+        const detection = await window.faceapi
+          .detectSingleFace(videoRef.current, new window.faceapi.TinyFaceDetectorOptions())
+          .withFaceLandmarks(true)
+          .withFaceExpressions();
 
-          if (modelRef.current) {
-            const pred  = await modelRef.current.predict(tensor);
-            const probs = Array.from(await pred.data());
-            allProbs.push(probs);
-            setProbBars(probs);
-            pred.dispose();
+        if (detection) {
+          setFaceDetected(true);
+          frames.push(detection.expressions);
+          setScanFrames([...frames]);
+
+          // Draw on canvas
+          if (canvasRef.current) {
+            const ctx = canvasRef.current.getContext("2d");
+            canvasRef.current.width  = videoRef.current.videoWidth;
+            canvasRef.current.height = videoRef.current.videoHeight;
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+
+            // Draw face box
+            const box = detection.detection.box;
+            ctx.strokeStyle = "#4F6B4A";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+            // Draw corner accents
+            const cs = 20;
+            ctx.strokeStyle = "#B8922F";
+            ctx.lineWidth = 4;
+            [[box.x, box.y],[box.x+box.width, box.y],
+             [box.x, box.y+box.height],[box.x+box.width, box.y+box.height]].forEach(([cx,cy]) => {
+              ctx.beginPath();
+              ctx.moveTo(cx - (cx > box.x ? cs : -cs), cy);
+              ctx.lineTo(cx, cy);
+              ctx.lineTo(cx, cy - (cy > box.y ? cs : -cs));
+              ctx.stroke();
+            });
+
+            // Label
+            ctx.fillStyle = "rgba(79,107,74,0.85)";
+            ctx.fillRect(box.x, box.y - 28, 120, 24);
+            ctx.fillStyle = "white";
+            ctx.font = "13px Inter";
+            ctx.fillText("Face detected ✓", box.x + 6, box.y - 10);
           }
-          tensor.dispose();
-        } catch (e) {}
-      }
+        } else {
+          setFaceDetected(false);
+        }
+      } catch(e) { /* continue */ }
 
-      p += 5;
-      setProgress(Math.min(p, 100));
+      progress += 4;
+      setScan(Math.min(progress, 100));
 
-      if (p >= 100) {
-        clearInterval(timerRef.current);
-        finish(allProbs);
+      if (progress >= 100) {
+        clearInterval(intervalRef.current);
+        finishScan(frames);
       }
-    }, 200);
+    }, 120);
   };
 
-  const finish = (allProbs) => {
-    if (allProbs.length === 0) {
-      const fallback = {
-        score: 45, risk: "Medium", dominant: "neutral",
-        mood: "Neutral", probs: new Array(7).fill(1 / 7)
-      };
-      setResult(fallback);
-      setPhase("result");
-      getAdvice(fallback);
+  const finishScan = (frames) => {
+    if (frames.length === 0) {
+      setPhase("ready");
       return;
     }
 
-    const avg = new Array(7).fill(0);
-    allProbs.forEach(p => p.forEach((v, i) => { avg[i] += v; }));
-    avg.forEach((v, i) => { avg[i] = v / allProbs.length; });
+    // Average expressions across all frames
+    const keys = ["happy","sad","angry","fearful","disgusted","surprised","neutral"];
+    const avg = {};
+    keys.forEach(k => {
+      avg[k] = frames.reduce((s,f) => s + (f[k]||0), 0) / frames.length;
+    });
 
-    const r = predictStress(avg);
-    setResult(r);
-    setProbBars(avg);
+    const result = expressionsToStress(avg);
+    setExpr(avg);
+    setWellness(result);
     setPhase("result");
-    getAdvice(r);
+    getAIAdvice(result);
   };
 
-  const getAdvice = async (r) => {
+  const getAIAdvice = async (result) => {
+    setAiLoading(true);
+    setPhase("result");
+
+    const exprSummary = result.expressions
+      ? Object.entries(result.expressions)
+          .sort((a,b) => b[1]-a[1])
+          .slice(0,3)
+          .map(([k,v]) => `${k}: ${(v*100).toFixed(0)}%`)
+          .join(", ")
+      : "neutral expression";
+
+    const prompt = `You are a compassionate AI wellness advisor for CAPF (Indian Armed Forces) personnel.
+
+A personnel member just completed a facial wellness scan. Here are the results:
+- Dominant Mood: ${result.mood}
+- Stress Risk Level: ${result.risk}
+- Stress Score: ${result.score}/100
+- Facial Expression Analysis: ${exprSummary}
+
+Write a warm, personal, empathetic response (150 words max):
+1. Acknowledge what their face is showing
+2. Give 2-3 specific, actionable wellness tips for their current emotional state
+3. If High risk, gently encourage them to speak to their Welfare Officer
+4. End with an encouraging statement specific to military service
+Write in flowing paragraphs, not bullet points. Be warm and human.`;
+
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-6",
-          max_tokens: 300,
-          system: "You are a wellness advisor for Indian Armed Forces. Be warm, brief, practical.",
-          messages: [{
-            role: "user",
-            content: "CAPF personnel facial scan: Mood=" + r.mood + ", Risk=" + r.risk + ", Score=" + r.score + "/100, Emotion=" + r.dominant + ". Give 2 specific wellness tips in 70 words max. Be encouraging."
-          }]
+          max_tokens: 1000,
+          system: "You are a compassionate wellness advisor for Indian Armed Forces personnel. Always be warm, culturally sensitive, and practical.",
+          messages: [{ role: "user", content: prompt }]
         })
       });
       const d = await res.json();
-      setAdvice(d.content?.[0]?.text || getDefault(r.risk));
+      setAiAdvice(d.content?.[0]?.text || getOfflineAdvice(result.risk));
     } catch {
-      setAdvice(getDefault(r.risk));
+      setAiAdvice(getOfflineAdvice(result.risk));
     }
+    setAiLoading(false);
   };
 
-  const getDefault = (risk) => ({
-    High:   "Your face shows significant stress. Please speak to your Welfare Officer today. Take slow deep breaths — 4 counts in, hold 4, out 4. You are stronger than you feel right now.",
-    Medium: "Some tension is visible. Step outside for 5 minutes and breathe fresh air. Connect with a trusted colleague — sharing lightens the load significantly.",
-    Low:    "You look calm and positive today! Keep nurturing this energy. Check in on a colleague who might need your support."
-  }[risk] || "Take care of yourself today.");
-
-  const RC = { High: "#e74c3c", Medium: "#e67e22", Low: "#27ae60" };
-  const EI = {
-    angry: "Stressed", disgust: "Uncomfortable", fear: "Anxious",
-    happy: "Happy", neutral: "Neutral", sad: "Sad", surprise: "Alert"
+  const getOfflineAdvice = (risk) => {
+    const m = {
+      High: "Your face is showing significant signs of stress and fatigue. It is completely understandable given the demands of your service. Please take a moment to breathe deeply — inhale for 4 counts, hold for 4, exhale for 4. Speak to your Welfare Officer today; you do not have to carry this alone. Rest is not weakness — it is what keeps you effective and strong.",
+      Medium: "Your expression suggests you are carrying some tension today. That is normal for someone in your position. Try stepping outside for even 5 minutes — fresh air and a short walk can shift your mood significantly. Connect with a trusted colleague and share how you are feeling. Small moments of rest during the day add up.",
+      Low: "Your face reflects a positive and stable state today. Keep nurturing this — your sleep, exercise, and social connections are clearly working. Check in on a colleague who might be struggling. Your steady presence is an asset to your unit."
+    };
+    return m[risk] || m.Medium;
   };
-  const EM = {
-    angry: "😤", disgust: "😒", fear: "😨",
-    happy: "😊", neutral: "😐", sad: "😔", surprise: "😮"
+
+  const riskColor = {
+    High:   "#C0392B",
+    Medium: "#D4870A",
+    Low:    "#4F6B4A"
+  };
+
+  const expressionEmoji = {
+    happy:"😊", sad:"😔", angry:"😤", fearful:"😨",
+    disgusted:"😒", surprised:"😮", neutral:"😐"
   };
 
   return (
-    <div style={{
-      position: "fixed", inset: 0, background: "rgba(0,0,0,0.88)", zIndex: 300,
-      display: "flex", alignItems: "center", justifyContent: "center",
-      padding: 16, fontFamily: "Inter,sans-serif"
-    }}>
-      <div style={{
-        width: "100%", maxWidth: 460, background: "#0F1825", borderRadius: 18,
-        border: "1px solid rgba(255,255,255,0.1)", overflow: "hidden",
-        maxHeight: "95vh", overflowY: "auto"
-      }}>
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)",
+      backdropFilter:"blur(8px)", zIndex:300,
+      display:"flex", alignItems:"center", justifyContent:"center",
+      padding:16, ...S }}>
+
+      <div style={{ width:"100%", maxWidth:520, background:"#0F1825",
+        borderRadius:20, border:"1px solid rgba(255,255,255,0.1)",
+        overflow:"hidden", maxHeight:"95vh", overflowY:"auto" }}>
 
         {/* Header */}
-        <div style={{
-          background: "#10192B", padding: "14px 18px",
-          display: "flex", justifyContent: "space-between", alignItems: "center",
-          borderBottom: "1px solid rgba(255,255,255,0.08)"
-        }}>
-          <div>
-            <div style={{ color: "#EDE9DD", fontWeight: 600, fontSize: 15 }}>
-              Face Wellness Scan
-            </div>
-            <div style={{ color: "#8D9AAE", fontSize: 11, marginTop: 2 }}>
-              AI stress detection · Private · Your trained model
+        <div style={{ background:T.ink, padding:"16px 20px",
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          borderBottom:"1px solid rgba(255,255,255,0.08)" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ width:36, height:36, borderRadius:10,
+              background:"linear-gradient(135deg,#4F6B4A,#B8922F)",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:18 }}>🧠</div>
+            <div>
+              <div style={{ ...H, color:T.paper, fontWeight:600, fontSize:16 }}>
+                Face Wellness Scan
+              </div>
+              <div style={{ fontSize:11, color:T.slate }}>
+                AI-powered stress detection · Private &amp; secure
+              </div>
             </div>
           </div>
-          <button onClick={() => { stop(); onClose(); }}
-            style={{ color: "#8D9AAE", background: "none", border: "none", fontSize: 20, cursor: "pointer" }}>
-            X
-          </button>
+          <button onClick={() => { cleanup(); onClose(); }}
+            style={{ color:T.slate, fontSize:20, background:"none", border:"none",
+              cursor:"pointer", padding:4 }}>✕</button>
         </div>
 
-        <div style={{ padding: 18 }}>
+        <div style={{ padding:20 }}>
 
-          {/* Init state */}
-          {phase === "init" && (
-            <div style={{ textAlign: "center", padding: "30px 20px" }}>
-              <div style={{
-                width: 36, height: 36,
-                border: "3px solid rgba(255,255,255,0.1)", borderTopColor: "#B8922F",
-                borderRadius: "50%", animation: "fws 0.8s linear infinite",
-                margin: "0 auto 14px"
-              }}/>
-              <div style={{ color: "#EDE9DD" }}>{loadMsg}</div>
-            </div>
-          )}
-
-          {/* Error state */}
-          {phase === "error" && (
-            <div style={{ textAlign: "center", padding: "30px 20px" }}>
-              <div style={{ color: "#e74c3c", marginBottom: 12 }}>{loadMsg}</div>
-              <button onClick={() => { stop(); onClose(); }}
-                style={{ padding: "8px 20px", background: "#4F6B4A", border: "none", borderRadius: 8, color: "white", cursor: "pointer" }}>
-                Close
-              </button>
-            </div>
-          )}
-
-          {/* Camera view */}
-          {(phase === "ready" || phase === "loading" || phase === "scanning") && (
-            <div>
-              <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", marginBottom: 14, background: "#000" }}>
-                <video ref={videoRef} autoPlay muted playsInline
-                  style={{ width: "100%", display: "block", maxHeight: 240, objectFit: "cover" }}/>
-                <canvas ref={canvasRef} style={{ display: "none" }}/>
-                {phase === "scanning" && (
-                  <div style={{
-                    position: "absolute", top: 8, right: 8,
-                    background: "rgba(79,107,74,0.9)", borderRadius: 20,
-                    padding: "3px 10px", fontSize: 11, color: "white"
-                  }}>
-                    Scanning... {progress}%
+          {/* LOADING */}
+          {(phase === "loading" || phase === "error") && (
+            <div style={{ textAlign:"center", padding:"40px 20px" }}>
+              {phase === "loading" ? (
+                <>
+                  <div style={{ width:48, height:48, border:"3px solid rgba(255,255,255,0.1)",
+                    borderTopColor:T.brass, borderRadius:"50%",
+                    animation:"spin 0.8s linear infinite", margin:"0 auto 20px" }}/>
+                  <div style={{ color:T.paper, fontSize:15, marginBottom:8 }}>{loadMsg}</div>
+                  <div style={{ fontSize:12, color:T.slate }}>
+                    Please allow camera access when prompted
                   </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize:48, marginBottom:16 }}>⚠️</div>
+                  <div style={{ color:"#e74c3c", fontSize:14, marginBottom:8 }}>{loadMsg}</div>
+                  <div style={{ fontSize:12, color:T.slate, marginBottom:20 }}>
+                    Make sure you allow camera permissions in your browser
+                  </div>
+                  <button onClick={() => { cleanup(); onClose(); }}
+                    style={{ padding:"10px 24px", borderRadius:8, background:T.olive,
+                      border:"none", color:"white", cursor:"pointer", fontSize:14 }}>
+                    Close
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* READY — Camera preview */}
+          {(phase === "ready" || phase === "scanning") && (
+            <>
+              <div style={{ position:"relative", borderRadius:12, overflow:"hidden",
+                marginBottom:16, background:"#000" }}>
+                <video ref={videoRef} autoPlay muted playsInline
+                  style={{ width:"100%", display:"block",
+                    transform:"scaleX(-1)", maxHeight:300, objectFit:"cover" }}/>
+                <canvas ref={canvasRef}
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%",
+                    transform:"scaleX(-1)" }}/>
+
+                {/* Scan overlay */}
+                {phase === "scanning" && (
+                  <div style={{ position:"absolute", inset:0,
+                    background:"linear-gradient(transparent 0%,rgba(79,107,74,0.05) 50%,transparent 100%)",
+                    animation:"scanLine 1s ease-in-out infinite" }}/>
                 )}
+
+                {/* Face status badge */}
+                <div style={{ position:"absolute", top:10, right:10,
+                  background: faceDetected ? "rgba(79,107,74,0.9)" : "rgba(192,57,43,0.9)",
+                  borderRadius:20, padding:"4px 12px", fontSize:11,
+                  color:"white", fontWeight:600 }}>
+                  {faceDetected ? "✓ Face detected" : "○ Looking for face..."}
+                </div>
               </div>
 
-              {/* Live emotion bars during scan */}
-              {phase === "scanning" && probBars.length > 0 && (
-                <div style={{
-                  background: "rgba(255,255,255,0.04)", borderRadius: 10,
-                  padding: 12, marginBottom: 12
-                }}>
-                  <div style={{ color: "#EDE9DD", fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
-                    Live Emotion Detection
-                  </div>
-                  {LABELS.map((label, i) => (
-                    <div key={label} style={{ marginBottom: 5 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 2 }}>
-                        <span style={{ color: "#8D9AAE" }}>{EM[label]} {EI[label]}</span>
-                        <span style={{ color: "#EDE9DD", fontWeight: 600 }}>
-                          {((probBars[i] || 0) * 100).toFixed(0)}%
-                        </span>
-                      </div>
-                      <div style={{ height: 4, background: "rgba(255,255,255,0.08)", borderRadius: 2 }}>
-                        <div style={{
-                          height: "100%",
-                          width: ((probBars[i] || 0) * 100) + "%",
-                          background: label === "happy" ? "#27ae60" : label === "neutral" ? "#5A6A7A" : "#e67e22",
-                          borderRadius: 2, transition: "width 0.2s"
-                        }}/>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Progress bar */}
+              {/* Scan progress */}
               {phase === "scanning" && (
-                <div style={{ marginBottom: 12 }}>
-                  <div style={{ height: 6, background: "rgba(255,255,255,0.08)", borderRadius: 3 }}>
-                    <div style={{
-                      height: "100%", width: progress + "%",
-                      background: "linear-gradient(90deg,#4F6B4A,#B8922F)",
-                      borderRadius: 3, transition: "width 0.2s"
-                    }}/>
+                <div style={{ marginBottom:16 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between",
+                    fontSize:12, color:T.slate, marginBottom:6 }}>
+                    <span>Analyzing expressions...</span>
+                    <span>{scanProgress}%</span>
+                  </div>
+                  <div style={{ height:6, background:"rgba(255,255,255,0.08)",
+                    borderRadius:3, overflow:"hidden" }}>
+                    <div style={{ height:"100%", width:`${scanProgress}%`,
+                      background:"linear-gradient(90deg,#4F6B4A,#B8922F)",
+                      borderRadius:3, transition:"width 0.1s" }}/>
+                  </div>
+                  <div style={{ fontSize:11, color:T.slate, marginTop:6, textAlign:"center" }}>
+                    {scanProgress < 30 ? "Detecting facial features..." :
+                     scanProgress < 60 ? "Reading emotional expressions..." :
+                     scanProgress < 90 ? "Calculating wellness score..." :
+                     "Almost done..."}
                   </div>
                 </div>
               )}
 
-              {/* Loading model */}
-              {phase === "loading" && (
-                <div style={{ textAlign: "center", padding: "12px 0", color: "#8D9AAE", fontSize: 13 }}>
-                  <div style={{
-                    width: 24, height: 24,
-                    border: "2px solid rgba(255,255,255,0.1)", borderTopColor: "#B8922F",
-                    borderRadius: "50%", animation: "fws 0.7s linear infinite",
-                    margin: "0 auto 8px"
-                  }}/>
-                  {loadMsg}
-                </div>
-              )}
-
-              {/* Start button */}
               {phase === "ready" && (
-                <button onClick={scan} style={{
-                  width: "100%", padding: "14px",
-                  background: "linear-gradient(135deg,#4F6B4A,#B8922F)",
-                  border: "none", borderRadius: 10, color: "white",
-                  fontSize: 15, fontWeight: 700, cursor: "pointer"
-                }}>
-                  Start Face Wellness Scan
-                </button>
+                <>
+                  <div style={{ background:"rgba(255,255,255,0.04)",
+                    border:"1px solid rgba(255,255,255,0.08)",
+                    borderRadius:10, padding:"12px 16px", marginBottom:16,
+                    fontSize:13, color:T.slate, lineHeight:1.6 }}>
+                    🔒 Your camera feed is processed locally in your browser.
+                    Nothing is stored or sent to any server. 100% private.
+                  </div>
+                  <button onClick={startScan}
+                    style={{ width:"100%", padding:"14px",
+                      background:"linear-gradient(135deg,#4F6B4A,#B8922F)",
+                      border:"none", borderRadius:10, color:"white",
+                      fontSize:16, fontWeight:700, cursor:"pointer",
+                      display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+                      ...H }}>
+                    🧠 Start Face Wellness Scan
+                  </button>
+                </>
               )}
-            </div>
+            </>
           )}
 
-          {/* Result */}
-          {phase === "result" && result && (
-            <div>
-              <div style={{ textAlign: "center", marginBottom: 16 }}>
-                <div style={{ fontSize: 48, marginBottom: 6 }}>{EM[result.dominant] || "😐"}</div>
-                <div style={{ fontSize: 24, fontWeight: 700, color: RC[result.risk], marginBottom: 4 }}>
-                  {result.mood}
+          {/* RESULT */}
+          {phase === "result" && wellness && (
+            <>
+              {/* Risk indicator */}
+              <div style={{ textAlign:"center", marginBottom:20 }}>
+                <div style={{ fontSize:56, marginBottom:8 }}>
+                  {expressionEmoji[wellness.dominant] || "😐"}
                 </div>
-                <div style={{ color: "#8D9AAE", fontSize: 13 }}>
-                  Stress Score: {result.score}/100 - {result.risk} Risk
+                <div style={{ ...H, fontSize:26, fontWeight:700,
+                  color: riskColor[wellness.risk], marginBottom:4 }}>
+                  {wellness.mood}
+                </div>
+                <div style={{ fontSize:13, color:T.slate }}>
+                  Stress Score: {wellness.score}/100 &nbsp;·&nbsp; {wellness.risk} Risk
                 </div>
               </div>
 
               {/* Score bar */}
-              <div style={{ height: 10, background: "rgba(255,255,255,0.08)", borderRadius: 5, marginBottom: 16 }}>
-                <div style={{
-                  height: "100%", width: result.score + "%",
-                  background: RC[result.risk], borderRadius: 5, transition: "width 1s"
-                }}/>
+              <div style={{ background:"rgba(255,255,255,0.06)",
+                borderRadius:10, padding:16, marginBottom:16 }}>
+                <div style={{ height:10, background:"rgba(255,255,255,0.08)",
+                  borderRadius:5, overflow:"hidden", marginBottom:8 }}>
+                  <div style={{ height:"100%", width:`${wellness.score}%`,
+                    background: wellness.score >= 60
+                      ? "linear-gradient(90deg,#e74c3c,#c0392b)"
+                      : wellness.score >= 35
+                      ? "linear-gradient(90deg,#e67e22,#d35400)"
+                      : "linear-gradient(90deg,#27ae60,#1e8449)",
+                    borderRadius:5, transition:"width 1s ease" }}/>
+                </div>
+                <div style={{ display:"flex", justifyContent:"space-between",
+                  fontSize:10, color:"rgba(255,255,255,0.3)" }}>
+                  <span>Relaxed</span><span>Moderate</span><span>High Stress</span>
+                </div>
               </div>
 
-              {/* Emotion breakdown */}
-              {result.probs && (
-                <div style={{
-                  background: "rgba(255,255,255,0.04)", borderRadius: 10,
-                  padding: 14, marginBottom: 14
-                }}>
-                  <div style={{ color: "#EDE9DD", fontWeight: 600, fontSize: 13, marginBottom: 10 }}>
-                    Emotion Analysis (Custom Trained Model)
-                  </div>
-                  {LABELS.map((label, i) => (
-                    <div key={label} style={{ marginBottom: 6 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 2 }}>
-                        <span style={{ color: "#8D9AAE" }}>{EM[label]} {EI[label]}</span>
-                        <span style={{ color: "#EDE9DD", fontWeight: 600 }}>
-                          {((result.probs[i] || 0) * 100).toFixed(1)}%
+              {/* Expression breakdown */}
+              {expressions && (
+                <div style={{ background:"rgba(255,255,255,0.04)",
+                  border:"1px solid rgba(255,255,255,0.08)",
+                  borderRadius:10, padding:16, marginBottom:16 }}>
+                  <div style={{ ...H, color:T.paper, fontWeight:600,
+                    fontSize:13, marginBottom:12 }}>Expression Breakdown</div>
+                  {Object.entries(expressions)
+                    .sort((a,b) => b[1]-a[1])
+                    .map(([emotion, value]) => (
+                    <div key={emotion} style={{ marginBottom:8 }}>
+                      <div style={{ display:"flex", justifyContent:"space-between",
+                        fontSize:12, marginBottom:3 }}>
+                        <span style={{ color:T.slate, textTransform:"capitalize" }}>
+                          {expressionEmoji[emotion]} {emotion}
+                        </span>
+                        <span style={{ color:T.paper, fontWeight:600 }}>
+                          {(value*100).toFixed(0)}%
                         </span>
                       </div>
-                      <div style={{ height: 5, background: "rgba(255,255,255,0.08)", borderRadius: 2 }}>
-                        <div style={{
-                          height: "100%",
-                          width: ((result.probs[i] || 0) * 100) + "%",
-                          background: label === "happy" ? "#27ae60"
-                            : label === "neutral" ? "#5A6A7A"
-                            : label === "surprise" ? "#B8922F"
-                            : "#e74c3c",
-                          borderRadius: 2
-                        }}/>
+                      <div style={{ height:5, background:"rgba(255,255,255,0.08)",
+                        borderRadius:3, overflow:"hidden" }}>
+                        <div style={{ height:"100%", width:`${value*100}%`,
+                          background: emotion==="happy" ? "#4F6B4A" :
+                                      emotion==="neutral" ? "#5A6A7A" :
+                                      emotion==="surprised" ? "#B8922F" : "#C0392B",
+                          borderRadius:3 }}/>
                       </div>
                     </div>
                   ))}
@@ -387,54 +484,68 @@ export default function FaceWellness({ onClose, onResult }) {
               )}
 
               {/* AI Advice */}
-              <div style={{
-                background: "rgba(184,146,47,0.1)",
-                border: "1px solid rgba(184,146,47,0.3)",
-                borderRadius: 10, padding: 14, marginBottom: 14
-              }}>
-                <div style={{ color: "#B8922F", fontWeight: 600, fontSize: 13, marginBottom: 8 }}>
-                  AI Wellness Advisor
+              <div style={{ background:"rgba(255,255,255,0.04)",
+                border:"1px solid rgba(184,146,47,0.3)",
+                borderRadius:10, padding:16, marginBottom:16 }}>
+                <div style={{ ...H, color:T.brass, fontWeight:600,
+                  fontSize:14, marginBottom:12,
+                  display:"flex", alignItems:"center", gap:8 }}>
+                  🤖 AI Wellness Advisor
                 </div>
-                <div style={{ fontSize: 13, color: "rgba(255,255,255,0.82)", lineHeight: 1.75 }}>
-                  {advice || "Loading personalized advice..."}
-                </div>
+                {aiLoading ? (
+                  <div style={{ display:"flex", alignItems:"center", gap:10,
+                    color:T.slate, fontSize:13 }}>
+                    <div style={{ width:16, height:16,
+                      border:"2px solid rgba(255,255,255,0.1)",
+                      borderTopColor:T.brass, borderRadius:"50%",
+                      animation:"spin 0.7s linear infinite" }}/>
+                    Analyzing your wellness profile...
+                  </div>
+                ) : (
+                  <div style={{ fontSize:13, color:"rgba(255,255,255,0.8)",
+                    lineHeight:1.75 }}>
+                    {aiAdvice}
+                  </div>
+                )}
               </div>
 
-              {/* Buttons */}
-              <div style={{ display: "flex", gap: 8 }}>
+              {/* Action buttons */}
+              <div style={{ display:"flex", gap:10 }}>
                 <button onClick={() => {
-                  setPhase("ready");
-                  setResult(null);
-                  setAdvice("");
-                  setProgress(0);
-                  setProbBars([]);
-                }} style={{
-                  flex: 1, padding: "11px",
-                  background: "rgba(255,255,255,0.06)",
-                  border: "1px solid rgba(255,255,255,0.1)",
-                  borderRadius: 8, color: "#8D9AAE", cursor: "pointer", fontSize: 13
-                }}>
-                  Scan Again
+                    setPhase("ready"); setWellness(null);
+                    setExpr(null); setAiAdvice(""); setScan(0);
+                  }}
+                  style={{ flex:1, padding:"12px",
+                    background:"rgba(255,255,255,0.06)",
+                    border:"1px solid rgba(255,255,255,0.1)",
+                    borderRadius:10, color:T.slate, cursor:"pointer",
+                    fontSize:13, ...S }}>
+                  🔄 Scan Again
                 </button>
                 <button onClick={() => {
-                  if (onResult) onResult(result);
-                  stop();
-                  onClose();
-                }} style={{
-                  flex: 2, padding: "11px",
-                  background: "linear-gradient(135deg,#4F6B4A,#B8922F)",
-                  border: "none", borderRadius: 8,
-                  color: "white", cursor: "pointer", fontSize: 13, fontWeight: 600
-                }}>
-                  Use This Result
+                    if (onResult) onResult(wellness);
+                    cleanup(); onClose();
+                  }}
+                  style={{ flex:2, padding:"12px",
+                    background:"linear-gradient(135deg,#4F6B4A,#B8922F)",
+                    border:"none", borderRadius:10, color:"white",
+                    cursor:"pointer", fontSize:13, fontWeight:600, ...H }}>
+                  ✓ Use This Result
                 </button>
               </div>
-            </div>
+            </>
           )}
-
         </div>
       </div>
-      <style>{"@keyframes fws{to{transform:rotate(360deg)}}"}</style>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes scanLine {
+          0%   { background-position: 0% 0%; }
+          50%  { background-position: 0% 100%; }
+          100% { background-position: 0% 0%; }
+        }
+      `}</style>
     </div>
   );
 }
